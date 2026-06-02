@@ -1,0 +1,122 @@
+<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="CheckDependencyPaths">
+    <Import Project=".\Sts2PathDiscovery.props"/>
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>true</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <RootNamespace>Sts2CombatAdvisor</RootNamespace>
+        <AssemblyName>Sts2CombatAdvisor</AssemblyName>
+        <AppOutputBase>$(MSBuildProjectDirectory)\</AppOutputBase>
+        <PathMap>$(AppOutputBase)=.\</PathMap>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <NoWarn>$(NoWarn);MSB3270</NoWarn>
+    </PropertyGroup>
+
+    <ItemGroup Condition="Exists('$(Sts2DataDir)')">
+        <Reference Include="0Harmony">
+            <HintPath>$(Sts2DataDir)/0Harmony.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+        <Reference Include="sts2">
+            <HintPath>$(Sts2DataDir)/sts2.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Krafs.Publicizer" Version="2.3.0" PrivateAssets="All"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Publicize Include="sts2" IncludeVirtualMembers="false" IncludeCompilerGeneratedMembers="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <None Include="Sts2CombatAdvisor.json" />
+    </ItemGroup>
+
+    <Target Name="CheckDependencyPaths">
+        <Error Text=" Slay the Spire 2 data not found at path '$(Sts2DataDir)'"
+               Condition="'$(Sts2DataDir)' == '' or !Exists('$(Sts2DataDir)')" />
+    </Target>
+
+    <Target Name="CopyToModsFolderOnBuild" AfterTargets="PostBuildEvent">
+        <Message Text="Copying .dll and manifest to mods folder." Importance="high" />
+        <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
+        <Copy SourceFiles="$(AssemblyName).json" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
+    </Target>
+
+    <!-- 2026-06-02 — link the Sts2CombatAI planner in-process so the overlay can recommend the
+         card-play ORDER for the live hand (StateSnapshotter.Capture → ActionPlanner.PlanNextStep).
+         Same source-include as Sts2CombatCore, MINUS the 3 ONNX files (no ONNX package here;
+         PlanNextStep/depth-2 doesn't need them — the only ONNX refs are comments). -->
+    <PropertyGroup>
+        <Sts2CombatAICore>$(MSBuildThisFileDirectory)..\Sts2CombatAI\Sts2CombatAICode\Core</Sts2CombatAICore>
+    </PropertyGroup>
+    <ItemGroup Condition="Exists('$(Sts2CombatAICore)')">
+        <Compile Include="$(Sts2CombatAICore)\Sim\IntentKind.cs"          Link="AI\Sim\IntentKind.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\OrbKind.cs"             Link="AI\Sim\OrbKind.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\TokenProducerAxes.cs"   Link="AI\Sim\TokenProducerAxes.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\CardEffectSummary.cs"   Link="AI\Sim\CardEffectSummary.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\SimCard.cs"             Link="AI\Sim\SimCard.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\SimEnemy.cs"            Link="AI\Sim\SimEnemy.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\SimAlly.cs"             Link="AI\Sim\SimAlly.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\SimState.cs"            Link="AI\Sim\SimState.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\StatusMath.cs"          Link="AI\Sim\StatusMath.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\DamageModifiers.cs"     Link="AI\Sim\DamageModifiers.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\EnemyTurnSimulator.cs"  Link="AI\Sim\EnemyTurnSimulator.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\AnalyticalSimulator.cs" Link="AI\Sim\AnalyticalSimulator.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\StateSnapshotter.cs"    Link="AI\Sim\StateSnapshotter.cs" />
+
+        <Compile Include="$(Sts2CombatAICore)\Reflection\CardReflection.cs"          Link="AI\Reflection\CardReflection.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Reflection\CombatReflection.cs"        Link="AI\Reflection\CombatReflection.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Reflection\EnchantmentBonusCatalog.cs" Link="AI\Reflection\EnchantmentBonusCatalog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Reflection\OrbCardCatalog.cs"          Link="AI\Reflection\OrbCardCatalog.cs" />
+
+        <Compile Include="$(Sts2CombatAICore)\Planner\Playstyle.cs"                 Link="AI\Planner\Playstyle.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\PlanScorerWeights.cs"         Link="AI\Planner\PlanScorerWeights.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\PowerCatalog.cs"              Link="AI\Planner\PowerCatalog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\RelicCatalog.cs"              Link="AI\Planner\RelicCatalog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\PowerSequencingTier.cs"       Link="AI\Planner\PowerSequencingTier.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\SkillSequencingTier.cs"       Link="AI\Planner\SkillSequencingTier.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\HandSynergy.cs"               Link="AI\Planner\HandSynergy.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\BuildSynergy.cs"              Link="AI\Planner\BuildSynergy.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CardOverrideCatalog.cs"       Link="AI\Planner\CardOverrideCatalog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\ArchetypeDetector.cs"         Link="AI\Planner\ArchetypeDetector.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\AmplifierSynergy.cs"          Link="AI\Planner\AmplifierSynergy.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\AxisSynergyLookup.cs"         Link="AI\Planner\AxisSynergyLookup.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CardRole.cs"                  Link="AI\Planner\CardRole.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CardVariance.cs"              Link="AI\Planner\CardVariance.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CombatContext.cs"             Link="AI\Planner\CombatContext.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CombatPlan.cs"                Link="AI\Planner\CombatPlan.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\ComboRecognition.cs"          Link="AI\Planner\ComboRecognition.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\DeckQuality.cs"               Link="AI\Planner\DeckQuality.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\DeckThroughput.cs"            Link="AI\Planner\DeckThroughput.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\EffectScoringWeights.cs"      Link="AI\Planner\EffectScoringWeights.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\EffectSynergy.cs"             Link="AI\Planner\EffectSynergy.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\FinisherIdentifier.cs"        Link="AI\Planner\FinisherIdentifier.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\OrbValueCatalog.cs"           Link="AI\Planner\OrbValueCatalog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\PoolMeans.cs"                 Link="AI\Planner\PoolMeans.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\RemainingTurnsEstimator.cs"   Link="AI\Planner\RemainingTurnsEstimator.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\SurvivalProjection.cs"        Link="AI\Planner\SurvivalProjection.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\WinConditionInference.cs"     Link="AI\Planner\WinConditionInference.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\PlanScorer.cs"                Link="AI\Planner\PlanScorer.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\CopyValueScorer.cs"           Link="AI\Planner\CopyValueScorer.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\ActionPlanner.cs"             Link="AI\Planner\ActionPlanner.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\MCTSPlanner.cs"               Link="AI\Planner\MCTSPlanner.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\SmartSelectorLogic.cs"        Link="AI\Planner\SmartSelectorLogic.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Planner\SelectorMode.cs"              Link="AI\Planner\SelectorMode.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Diagnostics\DecisionLog.cs"           Link="AI\Diagnostics\DecisionLog.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Data\CardCatalog.cs"                  Link="AI\Data\CardCatalog.cs" />
+
+        <EmbeddedResource Include="$(Sts2CombatAICore)\Data\card_triggers.json"
+                          LogicalName="Sts2CombatAI.card_triggers.json" Link="AI\Data\card_triggers.json" />
+        <EmbeddedResource Include="$(Sts2CombatAICore)\Data\pool_means.json"
+                          LogicalName="Sts2CombatAI.pool_means.json" Link="AI\Data\pool_means.json" />
+        <EmbeddedResource Include="$(Sts2CombatAICore)\Data\role_needs.json"
+                          LogicalName="Sts2CombatAI.role_needs.json" Link="AI\Data\role_needs.json" />
+    </ItemGroup>
+</Project>
