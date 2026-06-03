@@ -65,6 +65,7 @@
         <Compile Include="$(Sts2CombatAICore)\Sim\SimEnemy.cs"            Link="AI\Sim\SimEnemy.cs" />
         <Compile Include="$(Sts2CombatAICore)\Sim\SimAlly.cs"             Link="AI\Sim\SimAlly.cs" />
         <Compile Include="$(Sts2CombatAICore)\Sim\SimState.cs"            Link="AI\Sim\SimState.cs" />
+        <Compile Include="$(Sts2CombatAICore)\Sim\SimPotion.cs"           Link="AI\Sim\SimPotion.cs" />
         <Compile Include="$(Sts2CombatAICore)\Sim\StatusMath.cs"          Link="AI\Sim\StatusMath.cs" />
         <Compile Include="$(Sts2CombatAICore)\Sim\DamageModifiers.cs"     Link="AI\Sim\DamageModifiers.cs" />
         <Compile Include="$(Sts2CombatAICore)\Sim\EnemyTurnSimulator.cs"  Link="AI\Sim\EnemyTurnSimulator.cs" />
