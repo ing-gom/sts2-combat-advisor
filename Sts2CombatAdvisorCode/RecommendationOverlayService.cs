@@ -41,6 +41,10 @@ public partial class RecommendationOverlayService : Node
     // (red = sure kill, blue = defend, green = elite/boss buff).
     private Control? _potionMarker;
     private PotionModel? _potionTarget;
+    // 2026-06-04 — when the planner itself recommends USING a potion as the next action
+    // (sequencing value, e.g. amplifier → big attack), its Id is stored here and takes
+    // precedence over the heuristic advice below. "" = planner has no potion recommendation.
+    private string _plannerPotionId = "";
     private NPotionContainer? _potionContainer;
     private FieldInfo? _holdersField;
 
@@ -155,16 +159,43 @@ public partial class RecommendationOverlayService : Node
     private void FirstCardUpdate()
     {
         var sim = CaptureCombat();
-        if (sim == null) { _firstCard = ""; _badgeHolder = null; _lastSig = ""; _potionTarget = null; return; }
-        // Potion advice depends on HP / incoming damage (not in Sig), so recompute every tick — it's cheap.
-        var (pot, col) = ComputePotionAdvice(sim);
-        _potionTarget = pot;
-        if (_potionMarker != null && pot != null) _potionMarker.Modulate = col;
+        if (sim == null) { _firstCard = ""; _badgeHolder = null; _lastSig = ""; _potionTarget = null; _plannerPotionId = ""; return; }
+
         string sig = Sig(sim);
-        if (sig == _lastSig) return;     // state unchanged → skip the planner run
-        _lastSig = sig;
-        var step = Sts2CombatAI.Planner.ActionPlanner.PlanNextStep(sim);
-        _firstCard = (step is { } ps && ps.Card != null) ? ps.Card.Id : "";
+        bool stateChanged = sig != _lastSig;
+        if (stateChanged)
+        {
+            _lastSig = sig;
+            // 2026-06-04 — considerPotions:true lets the planner recommend USING a potion as the
+            // next action (e.g. amplifier potion before a big attack, or a finisher potion).
+            var step = Sts2CombatAI.Planner.ActionPlanner.PlanNextStep(sim, considerPotions: true);
+            if (step is { } ps && ps.IsPotion)
+            {
+                _plannerPotionId = ps.Potion!.Id;   // recommend the potion; no card badge this step
+                _firstCard = "";
+            }
+            else
+            {
+                _plannerPotionId = "";
+                _firstCard = (step is { } ps2 && ps2.Card != null) ? ps2.Card.Id : "";
+            }
+        }
+
+        // Potion marker: a planner potion recommendation (gold ▲ = "use now") takes precedence;
+        // otherwise fall back to the lightweight heuristic advice (defend/kill/buff colours).
+        if (!string.IsNullOrEmpty(_plannerPotionId))
+        {
+            _potionTarget = FindPotionById(_plannerPotionId);
+            if (_potionMarker != null && _potionTarget != null) _potionMarker.Modulate = PotionPlanner;
+        }
+        else
+        {
+            var (pot, col) = ComputePotionAdvice(sim);
+            _potionTarget = pot;
+            if (_potionMarker != null && pot != null) _potionMarker.Modulate = col;
+        }
+
+        if (!stateChanged) return;     // badge holder lookup only needs to run on state change
         _badgeHolder = string.IsNullOrEmpty(_firstCard) ? null : FindHolderForCard(_firstCard);
         _badgeShortcut = _badgeHolder != null ? FindShortcutNode(_badgeHolder) : null;
         if (_badgeHolder != null && !_loggedHolderTree)   // one-time diag: dump the card node tree.
@@ -314,6 +345,7 @@ public partial class RecommendationOverlayService : Node
     private static readonly Color PotionKill = new(1f, 0.35f, 0.35f);   // 처치 확정 (red)
     private static readonly Color PotionDefend = new(0.4f, 0.7f, 1f);   // 위기 방어 (blue)
     private static readonly Color PotionBuff = new(0.45f, 1f, 0.5f);    // 엘리트/보스 버프 (green)
+    private static readonly Color PotionPlanner = new(1f, 0.85f, 0.2f); // 플래너 추천: 지금 사용 (gold)
 
     // Potion-use recommendation (lightweight heuristic, per the chosen triggers):
     //   위기 방어 — lethal incoming, or incoming drops HP below 30% maxHP → a block/heal potion
@@ -374,6 +406,24 @@ public partial class RecommendationOverlayService : Node
             catch { }
         }
         return (best, bestColor);
+    }
+
+    // 2026-06-04 — live PotionModel whose Id matches the planner's recommendation. Null if not held.
+    private static PotionModel? FindPotionById(string id)
+    {
+        try
+        {
+            var cm = CombatManager.Instance;
+            if (cm == null) return null;
+            if (CombatReflection.CombatManagerStateField?.GetValue(cm) is not CombatState cs) return null;
+            var player = cs.Players.FirstOrDefault();
+            var potions = player?.Potions;
+            if (potions == null) return null;
+            foreach (var p in potions)
+                if (p != null && p.Id.Entry == id) return p;
+        }
+        catch { }
+        return null;
     }
 
     // The on-screen NPotionHolder showing the given potion model (live combat HUD). Null if not found.
