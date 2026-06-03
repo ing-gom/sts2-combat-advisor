@@ -329,11 +329,12 @@ public partial class RecommendationOverlayService : Node
         var player = cs.Players.FirstOrDefault();
         var potions = player?.Potions?.Where(p => p != null).ToList();
         if (potions == null || potions.Count == 0) return (null, default);
-        bool eliteOrBoss = (cs.Encounter?.RoomType.ToString()) is "Elite" or "Boss";
 
         int incoming = Sts2CombatAI.Sim.EnemyTurnSimulator.PredictPlayerDmg(sim);
         int hpAfter = sim.PlayerHp - incoming;
-        int dangerFloor = (int)System.Math.Ceiling(sim.PlayerMaxHp * 0.30);
+        // 2026-06-03 — relaxed defensive threshold (was 30% maxHP) so block/heal potions are
+        // suggested in normal fights too, not only at near-death. 50% = "taking real damage".
+        int dangerFloor = (int)System.Math.Ceiling(sim.PlayerMaxHp * 0.50);
 
         PotionModel? best = null; Color bestColor = default; int bestPri = 0;
         void Consider(int pri, PotionModel p, Color c) { if (pri > bestPri) { bestPri = pri; best = p; bestColor = c; } }
@@ -364,8 +365,10 @@ public partial class RecommendationOverlayService : Node
                         Consider(3, p, PotionKill);
                 }
 
-                // 엘리트/보스 한정 — buff/utility (neither defensive nor a damage potion)
-                if (!hasBlock && !hasHeal && !hasDmg && eliteOrBoss)
+                // 2026-06-03 — buff/utility potions (neither defensive nor damage) are now
+                // suggested in normal fights too (was elite/boss-only), at the lowest priority
+                // so defend/kill advice still wins when present.
+                if (!hasBlock && !hasHeal && !hasDmg)
                     Consider(1, p, PotionBuff);
             }
             catch { }
