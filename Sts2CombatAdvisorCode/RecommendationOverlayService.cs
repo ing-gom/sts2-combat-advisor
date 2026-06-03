@@ -104,6 +104,40 @@ public partial class RecommendationOverlayService : Node
         return lbl;
     }
 
+    public override void _Input(InputEvent @event)
+    {
+        // F9 — diagnostic dump of the planner's per-card scoring for the current hand.
+        if (@event is InputEventKey { Pressed: true, Keycode: Key.F9 })
+            try { DumpPlannerCandidates(); } catch (Exception ex) { MainFile.Logger.Warn($"[CombatAdvisor] dump: {ex.Message}"); }
+    }
+
+    /// F9 — log every hand candidate's score breakdown. firstScore = the card played alone,
+    /// secondScore = the best depth-2 follow-up after it, total = the 2-play sequence value,
+    /// bestNext = which follow-up the lookahead chose. This explains why a setup card (e.g.
+    /// BLOODLETTING → THE_BOMB) did or didn't beat an immediate play.
+    private static void DumpPlannerCandidates()
+    {
+        var sim = CaptureCombat();
+        if (sim == null) { MainFile.Logger.Info("[CombatAdvisor] F9: not in combat."); return; }
+        var step = Sts2CombatAI.Planner.ActionPlanner.PlanNextStep(sim);   // (re)populates LastCandidates / LastEmptyReason
+        var cands = Sts2CombatAI.Planner.ActionPlanner.LastCandidates;
+        var emptyReason = Sts2CombatAI.Planner.ActionPlanner.LastEmptyReason;
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"[CombatAdvisor] F9 dump — energy={sim.PlayerEnergy} hp={sim.PlayerHp}/{sim.PlayerMaxHp} aliveEnemies={sim.Enemies.Count(e => e.IsAlive)}\n");
+        // Per-hand-card facts, independent of the planner trace (so stale traces can't mislead).
+        foreach (var c in sim.Hand)
+        {
+            int sc = 0; try { sc = Sts2CombatAI.Planner.PlanScorer.Score(c, -1, sim); } catch { }
+            sb.Append($"  HAND {c.Id,-20} cost={c.Cost} playable={c.IsPlayable} eGain={c.EnergyGain} afford={(c.Cost <= sim.PlayerEnergy)} score(-1)={sc}\n");
+        }
+        sb.Append($"  RECOMMENDED first = {(step is { } ps && ps.Card != null ? ps.Card.Id : "<none>")}\n");
+        if (emptyReason != null) sb.Append($"  emptyReason = {emptyReason}\n");
+        var handIds = new System.Collections.Generic.HashSet<string>(sim.Hand.Select(c => c.Id));
+        foreach (var c in cands.OrderByDescending(c => c.total))
+            sb.Append($"    CAND {c.id,-20} tgt={c.targetIdx,2} first={c.firstScore,7} second={c.secondScore,7} total={c.total,7} next={c.bestNextId ?? "-"}{(handIds.Contains(c.id) ? "" : "  [STALE: not in hand]")}\n");
+        MainFile.Logger.Info(sb.ToString());
+    }
+
     /// Hover marker every frame; the recommended first card + potion advice recompute on a
     /// throttle, and only when a cheap combat-state signature actually changes.
     public override void _Process(double delta)
