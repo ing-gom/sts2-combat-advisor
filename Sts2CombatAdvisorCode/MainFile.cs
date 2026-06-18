@@ -21,6 +21,11 @@ public partial class MainFile : Node
             harmony.PatchAll(typeof(MainFile).Assembly);
             Logger.Info("[CombatAdvisor] Harmony patches applied.");
 
+            // Enable empty-hand draw-engine recognition (UnceasingTop draw-on-empty + ScreamingFlagon
+            // payoff) in the planner. The env gate (STS2_SIM_DRAW_ENGINE) can't be set in-game, and the
+            // feature is a no-op for any deck without those relics, so the overlay turns it on directly.
+            Sts2CombatAI.Sim.AnalyticalSimulator.UseDrawEngine = true;
+
             if (Engine.GetMainLoop() is SceneTree tree)
                 RecommendationOverlayService.Install(tree);
 
