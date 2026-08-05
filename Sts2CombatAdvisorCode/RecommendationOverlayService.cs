@@ -9,6 +9,7 @@ using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes.Potions;
 using MegaCrit.Sts2.Core.Nodes.Rooms;
+using MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext;
 using Sts2CombatAdvisor.Reflection;
 using Sts2CombatAI.Sim;
 
@@ -23,9 +24,13 @@ public partial class RecommendationOverlayService : Node
     private CanvasLayer? _layer;
 
     // Hover-driven marker over the enemy the HOVERED card should hit (game arrow; same-name safe).
+    // 2026-06-04 — also follows the card while it is GRABBED/being played (not just on hover), so
+    // the target hint stays on screen exactly when you are dragging the card onto an enemy.
     private Control? _marker;
     private Creature? _markTarget;
     private string _lastHoverCard = "";
+    private FieldInfo? _currentCardPlayField;   // NPlayerHand._currentCardPlay (dragged holder source)
+    private PropertyInfo? _cardPlayHolderProp;  // NCardPlay.Holder (inherited; cached for the per-frame drag path)
 
     // "Play this first" indicator next to the recommended card.
     private Control? _badge;
@@ -41,6 +46,12 @@ public partial class RecommendationOverlayService : Node
     // (red = sure kill, blue = defend, green = elite/boss buff).
     private Control? _potionMarker;
     private PotionModel? _potionTarget;
+    // 2026-06-04 — when the recommended potion targets a single enemy (damage potion / planner
+    // potion play with a target), this marks WHICH enemy to throw it at — previously the potion
+    // arrow told you to use a potion but not at whom. Coloured to match the potion arrow.
+    private Control? _potionEnemyMarker;
+    private Creature? _potionEnemyTarget;
+    private int _plannerPotionTargetIdx = -1;
     // 2026-06-04 — when the planner itself recommends USING a potion as the next action
     // (sequencing value, e.g. amplifier → big attack), its Id is stored here and takes
     // precedence over the heuristic advice below. "" = planner has no potion recommendation.
@@ -63,9 +74,11 @@ public partial class RecommendationOverlayService : Node
         _marker = MakeMarker(arrow, "▼", new Color(1f, 0.35f, 0.35f));   // points at hovered card's target enemy
         _badge = MakeMarker(arrow, "▶", new Color(0.4f, 1f, 0.45f));     // "play this first"
         _potionMarker = MakeMarker(arrow, "▲", new Color(1f, 1f, 1f), 0f); // BELOW the potion, points up (colour set per advice)
+        _potionEnemyMarker = MakeMarker(arrow, "▼", new Color(1f, 1f, 1f));  // OVER the potion's target enemy (colour set per advice)
         _layer.AddChild(_marker);
         _layer.AddChild(_badge);
         _layer.AddChild(_potionMarker);
+        _layer.AddChild(_potionEnemyMarker);
 
         MainFile.Logger.Info("[CombatAdvisor] recommendation overlay ready.");
     }
@@ -123,22 +136,67 @@ public partial class RecommendationOverlayService : Node
     {
         var sim = CaptureCombat();
         if (sim == null) { MainFile.Logger.Info("[CombatAdvisor] F9: not in combat."); return; }
-        var step = Sts2CombatAI.Planner.ActionPlanner.PlanNextStep(sim);   // (re)populates LastCandidates / LastEmptyReason
+        // considerPotions:true so the potion evaluation (LastPotionCandidates / LastBestCardTotal)
+        // is populated alongside the card candidates — the overlay's actual recommendation path.
+        var step = Sts2CombatAI.Planner.ActionPlanner.PlanNextStep(sim, considerPotions: true);
         var cands = Sts2CombatAI.Planner.ActionPlanner.LastCandidates;
         var emptyReason = Sts2CombatAI.Planner.ActionPlanner.LastEmptyReason;
         var sb = new System.Text.StringBuilder();
-        sb.Append($"[CombatAdvisor] F9 dump — energy={sim.PlayerEnergy} hp={sim.PlayerHp}/{sim.PlayerMaxHp} aliveEnemies={sim.Enemies.Count(e => e.IsAlive)}\n");
+        sb.Append($"[CombatAdvisor] F9 dump — energy={sim.PlayerEnergy} hp={sim.PlayerHp}/{sim.PlayerMaxHp} block={sim.PlayerBlock} aliveEnemies={sim.Enemies.Count(e => e.IsAlive)}\n");
+        // Threat context — total incoming damage (PredictPlayerDmg), each alive enemy's CURRENT
+        // intent, and the player's block-affecting debuffs. A screenshot then shows whether the
+        // planner sees the real threat (Mode B: intent already switched away → a defend pick is
+        // stale) and whether Frail/Weak is shrinking the block it can raise (Mode A: under-block →
+        // takes the hit it should have covered). EffectiveBlock ≈ rawBlock×(frail?0.75:1)+dex.
+        int incoming = 0; try { incoming = Sts2CombatAI.Sim.EnemyTurnSimulator.PredictPlayerDmg(sim); } catch { }
+        sb.Append($"  THREAT incoming={incoming} frail={sim.PlayerFrail} weak={sim.PlayerWeak} vuln={sim.PlayerVulnerable} dex={sim.PlayerDexterity}\n");
+        for (int ei = 0; ei < sim.Enemies.Count; ei++)
+        {
+            var e = sim.Enemies[ei];
+            if (!e.IsAlive) continue;
+            sb.Append($"    ENEMY[{ei}] hp={e.Hp} intent={e.TotalIntentDamage}{(e.HasAttackIntent ? "(atk)" : "(non-atk)")}\n");
+        }
+        // Relics the sim recognizes (class-name → counter). Lets us confirm which relics are
+        // captured and modeled (e.g. Orichalcum affects the RAGE play-order decision).
+        if (sim.PlayerRelics is { Count: > 0 })
+            sb.Append($"  RELICS = {string.Join(", ", sim.PlayerRelics.Select(kv => kv.Value > 1 ? $"{kv.Key}:{kv.Value}" : kv.Key))}\n");
         // Per-hand-card facts, independent of the planner trace (so stale traces can't mislead).
+        // playOrderBias = the same nudge/hold the planner folds into each candidate's firstScore
+        // (CAND.first = score + playOrderBias). It's what settles play ORDER: e.g. RAGE (격노) gets a
+        // positive nudge to precede its attacks, OR a large negative HOLD (−3000) when Orichalcum is
+        // worn and RAGE's block ≤ the relic's blockless +6 — making "play attacks first, hold RAGE"
+        // the intended (mutual-exclusion) recommendation. Surfacing it explains why the order looks
+        // backwards in screenshots.
+        var dumpWeights = Sts2CombatAI.Planner.PlanScorerWeights.For(
+            Sts2CombatAI.Planner.PlaystyleResolver.Resolve(sim));
         foreach (var c in sim.Hand)
         {
             int sc = 0; try { sc = Sts2CombatAI.Planner.PlanScorer.Score(c, -1, sim); } catch { }
-            sb.Append($"  HAND {c.Id,-20} cost={c.Cost} playable={c.IsPlayable} eGain={c.EnergyGain} afford={(c.Cost <= sim.PlayerEnergy)} score(-1)={sc}\n");
+            int pob = 0; try { pob = Sts2CombatAI.Planner.PlanScorer.PlayOrderBias(c, sim, dumpWeights); } catch { }
+            sb.Append($"  HAND {c.Id,-20} cost={c.Cost} playable={c.IsPlayable} eGain={c.EnergyGain} afford={(c.Cost <= sim.PlayerEnergy)} score(-1)={sc} playOrderBias={pob}\n");
         }
         sb.Append($"  RECOMMENDED first = {(step is { } ps && ps.Card != null ? ps.Card.Id : "<none>")}\n");
         if (emptyReason != null) sb.Append($"  emptyReason = {emptyReason}\n");
         var handIds = new System.Collections.Generic.HashSet<string>(sim.Hand.Select(c => c.Id));
         foreach (var c in cands.OrderByDescending(c => c.total))
             sb.Append($"    CAND {c.id,-20} tgt={c.targetIdx,2} first={c.firstScore,7} second={c.secondScore,7} total={c.total,7} next={c.bestNextId ?? "-"}{(handIds.Contains(c.id) ? "" : "  [STALE: not in hand]")}\n");
+
+        // Potion evaluation — why a potion was / wasn't recommended over the best card play.
+        // A potion is only chosen when its lookahead total beats bestCardTotal by PotionWinMargin.
+        // NOTE: potions whose effect isn't a flat amount (e.g. Fortifier = current block ×2) are
+        // classified PotionKind.Other and skipped here entirely — they never appear below.
+        int bestCard = Sts2CombatAI.Planner.ActionPlanner.LastBestCardTotal;
+        int margin = Sts2CombatAI.Planner.ActionPlanner.PotionWinMargin;
+        var pots = Sts2CombatAI.Planner.ActionPlanner.LastPotionCandidates;
+        sb.Append($"  POTIONS — bestCardTotal={bestCard} bar(=bestCard+{margin})={bestCard + margin} | held={sim.PlayerPotions.Count} evaluated={pots.Count}\n");
+        foreach (var pc in pots.OrderByDescending(p => p.total))
+            sb.Append($"    POT  {pc.id,-22} kind={pc.kind,-9} tgt={pc.targetIdx,2} first={pc.firstScore,7} total={pc.total,7} {(pc.total > bestCard + margin ? "[BEATS BAR → would recommend]" : "[below bar → hold]")}\n");
+        // Surface held potions the planner never scored (PotionKind.Other), so an unmodeled potion
+        // (the reason it's "never used") is obvious instead of silently missing.
+        var scored = new System.Collections.Generic.HashSet<string>(pots.Select(p => p.id));
+        foreach (var p in sim.PlayerPotions)
+            if (!scored.Contains(p.Id))
+                sb.Append($"    POT  {p.Id,-22} kind=Other     UNMODELED → never recommended (effect not a flat amount)\n");
         MainFile.Logger.Info(sb.ToString());
     }
 
@@ -146,20 +204,32 @@ public partial class RecommendationOverlayService : Node
     /// throttle, and only when a cheap combat-state signature actually changes.
     public override void _Process(double delta)
     {
+        // Only draw the combat overlay while the combat room is the FOREGROUND screen. Opening the
+        // map, a card/relic inspect, the rewards screen, or any modal pushes a different
+        // IScreenContext on top while the combat hand/enemies stay in the tree behind it — so
+        // without this gate the Layer-128 markers bleed through onto those screens. Hide the whole
+        // CanvasLayer (and skip the per-frame marker work) until combat is the active screen again.
+        bool combatForeground = false;
+        try { combatForeground = ActiveScreenContext.Instance?.GetCurrentScreen() is NCombatRoom; }
+        catch { combatForeground = false; }
+        if (_layer != null && _layer.Visible != combatForeground) _layer.Visible = combatForeground;
+        if (!combatForeground) return;
+
         // Hover marker (target enemy of the hovered card) — every frame, cheap.
         try { HoverUpdate(); } catch (Exception ex) { MainFile.Logger.Warn($"[CombatAdvisor] hover: {ex.Message}"); }
         // "Play this first" badge — recompute the top card only when the state changes (throttled).
         _pollAccum += delta;
         if (_pollAccum >= 0.3) { _pollAccum = 0; try { FirstCardUpdate(); } catch (Exception ex) { MainFile.Logger.Warn($"[CombatAdvisor] firstcard: {ex.Message}"); } }
-        PositionMarker();        // ▼ over target enemy (hover)
+        PositionEnemyMarker(_marker, _markTarget, 0f);                 // ▼ over target enemy (hover/grab)
         PositionBadge();         // ▶ over the recommended first card
         PositionPotionMarker();  // ▲ below the recommended potion
+        PositionEnemyMarker(_potionEnemyMarker, _potionEnemyTarget, ArrowSize + 4f); // ▼ over the potion's target enemy (raised above the hover ▼)
     }
 
     private void FirstCardUpdate()
     {
         var sim = CaptureCombat();
-        if (sim == null) { _firstCard = ""; _badgeHolder = null; _lastSig = ""; _potionTarget = null; _plannerPotionId = ""; return; }
+        if (sim == null) { _firstCard = ""; _badgeHolder = null; _lastSig = ""; _potionTarget = null; _plannerPotionId = ""; _plannerPotionTargetIdx = -1; _potionEnemyTarget = null; return; }
 
         string sig = Sig(sim);
         bool stateChanged = sig != _lastSig;
@@ -172,27 +242,38 @@ public partial class RecommendationOverlayService : Node
             if (step is { } ps && ps.IsPotion)
             {
                 _plannerPotionId = ps.Potion!.Id;   // recommend the potion; no card badge this step
+                _plannerPotionTargetIdx = ps.TargetIdx;   // enemy target for damage potions (-1 = self/all)
                 _firstCard = "";
             }
             else
             {
                 _plannerPotionId = "";
+                _plannerPotionTargetIdx = -1;
                 _firstCard = (step is { } ps2 && ps2.Card != null) ? ps2.Card.Id : "";
             }
         }
 
-        // Potion marker: a planner potion recommendation (gold ▲ = "use now") takes precedence;
-        // otherwise fall back to the lightweight heuristic advice (defend/kill/buff colours).
+        // 2026-06-04 — single recommendation: only the planner's chosen next step is shown. If it
+        // picked a card, the card badge (▶) shows and NO potion marker appears; if it picked a
+        // potion, the gold ▲ shows and no card badge. (The old always-on heuristic potion advice
+        // was removed so a card and a potion never light up at the same time.)
         if (!string.IsNullOrEmpty(_plannerPotionId))
         {
             _potionTarget = FindPotionById(_plannerPotionId);
+            // Enemy marker (▼) only for single-enemy "throw at" potions (TargetType.AnyEnemy).
+            // Self/AOE potions (block, heal, buff, all-enemy damage) have no single throw target —
+            // PickPotionTarget still returns an enemy index for them, so gate on the live TargetType.
+            bool singleEnemy = _potionTarget != null
+                && _potionTarget.TargetType == MegaCrit.Sts2.Core.Entities.Cards.TargetType.AnyEnemy;
+            _potionEnemyTarget = (singleEnemy && _plannerPotionTargetIdx >= 0 && _plannerPotionTargetIdx < sim.Enemies.Count)
+                ? sim.Enemies[_plannerPotionTargetIdx].SourceRef : null;
             if (_potionMarker != null && _potionTarget != null) _potionMarker.Modulate = PotionPlanner;
+            if (_potionEnemyMarker != null) _potionEnemyMarker.Modulate = PotionPlanner;
         }
         else
         {
-            var (pot, col) = ComputePotionAdvice(sim);
-            _potionTarget = pot;
-            if (_potionMarker != null && pot != null) _potionMarker.Modulate = col;
+            _potionTarget = null;
+            _potionEnemyTarget = null;
         }
 
         if (!stateChanged) return;     // badge holder lookup only needs to run on state change
@@ -236,7 +317,21 @@ public partial class RecommendationOverlayService : Node
         var sb = new System.Text.StringBuilder();
         foreach (var c in sim.Hand) sb.Append(c.Id).Append(',');
         sb.Append('|').Append(sim.PlayerEnergy);
-        foreach (var e in sim.Enemies) sb.Append('|').Append(e.Hp);
+        // 2026-06-04 — include player HP/block and the potion inventory so a NON-damage action
+        // registers as a state change. Bug: throwing a self/buff/block potion (e.g. FORTIFIER)
+        // leaves hand + energy + enemy-HP untouched, so the old signature was identical → the
+        // overlay skipped its recompute (stateChanged=false) and stayed stuck on the stale potion
+        // recommendation, never surfacing the follow-up card. The potion count/ids change the
+        // moment a potion is consumed; HP/block cover heal/block potions and self-block skills.
+        sb.Append('|').Append(sim.PlayerHp).Append('/').Append(sim.PlayerBlock);
+        sb.Append('|').Append(sim.PlayerPotions.Count);
+        foreach (var p in sim.PlayerPotions) sb.Append(',').Append(p.Id);
+        // 2026-06-04 — include each enemy's CURRENT intent damage, not just HP. Without it, an
+        // enemy switching intent WITHOUT changing HP (attack → buff/debuff, or a different attack
+        // value) left the signature identical → the overlay never recomputed → it kept recommending
+        // the defend card chosen when the enemy was still attacking (and never switched to offense
+        // once the incoming threat vanished). TotalIntentDamage flips the moment the threat changes.
+        foreach (var e in sim.Enemies) sb.Append('|').Append(e.Hp).Append(':').Append(e.TotalIntentDamage);
         return sb.ToString();
     }
 
@@ -263,34 +358,60 @@ public partial class RecommendationOverlayService : Node
         _badge.Visible = true;
     }
 
-    // Place the ▶ marker over the enemy the next recommended card should hit.
-    private void PositionMarker()
+    // Place a ▼ marker over the given enemy (above its head). Shared by the hover/grab card-target
+    // marker and the potion's target-enemy marker. extraUp raises it (so two markers on the same
+    // enemy stack instead of overlapping).
+    private static void PositionEnemyMarker(Control? marker, Creature? target, float extraUp)
     {
-        if (_marker == null) return;
+        if (marker == null) return;
         try
         {
-            var node = _markTarget != null ? NCombatRoom.Instance?.GetCreatureNode(_markTarget) : null;
+            var node = target != null ? NCombatRoom.Instance?.GetCreatureNode(target) : null;
             var vis = node?.Visuals;
-            if (vis == null || !GodotObject.IsInstanceValid(vis)) { if (_marker.Visible) _marker.Visible = false; return; }
+            if (vis == null || !GodotObject.IsInstanceValid(vis)) { if (marker.Visible) marker.Visible = false; return; }
             // Anchor at the creature's INTENT marker (above its head, on the sprite), world→screen.
             // Place the down-arrow so its tip sits just above the head, centred horizontally.
             Vector2 screen = vis.IntentPosition.GetGlobalTransformWithCanvas().Origin;
-            _marker.Position = screen + new Vector2(-ArrowSize / 2f, -ArrowSize - MarkerGap);
-            _marker.Visible = true;
+            marker.Position = screen + new Vector2(-ArrowSize / 2f, -ArrowSize - MarkerGap - extraUp);
+            marker.Visible = true;
         }
-        catch { if (_marker.Visible) _marker.Visible = false; }
+        catch { if (marker.Visible) marker.Visible = false; }
     }
 
     private void HoverUpdate()
     {
         // The game already tracks the hovered/focused card holder; read its CardModel via reflection
         // (robust to exact member names). Only recompute the target when the hovered card changes.
-        var holder = NCombatRoom.Instance?.Ui?.Hand?.FocusedHolder;
+        // 2026-06-04 — when a card is GRABBED to be played the game clears FocusedHolder (OnHolderUnfocused),
+        // so the hint used to vanish exactly when you start dragging onto an enemy. Fall back to the
+        // dragged holder so the ▼ target marker stays up through the whole pick-up → aim → play motion.
+        object? holder = NCombatRoom.Instance?.Ui?.Hand?.FocusedHolder ?? GetDraggedHolder();
         if (holder == null) { _markTarget = null; _lastHoverCard = ""; return; }
         string cardId = GetHolderCardId(holder);
         if (cardId == _lastHoverCard) return;
         _lastHoverCard = cardId;
         _markTarget = string.IsNullOrEmpty(cardId) ? null : ComputeTargetFor(cardId);
+    }
+
+    // The card holder currently being played/dragged (NPlayerHand._currentCardPlay.Holder), or null
+    // when not in card play. Loosely typed (returns the NHandCardHolder as object) so GetHolderCardId
+    // can read its CardModel by reflection — no extra type usings needed.
+    private object? GetDraggedHolder()
+    {
+        try
+        {
+            var hand = NCombatRoom.Instance?.Ui?.Hand;
+            if (hand == null || !hand.InCardPlay) return null;
+            _currentCardPlayField ??= hand.GetType().GetField("_currentCardPlay",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            var play = _currentCardPlayField?.GetValue(hand);
+            if (play == null) return null;
+            // Holder is declared on the NCardPlay base, so the same PropertyInfo serves both the
+            // mouse and controller play subtypes — cache it once (rule: no per-frame reflection).
+            _cardPlayHolderProp ??= play.GetType().GetProperty("Holder", BindingFlags.Public | BindingFlags.Instance);
+            return _cardPlayHolderProp?.GetValue(play);
+        }
+        catch { return null; }
     }
 
     private static SimState? CaptureCombat()
@@ -341,72 +462,8 @@ public partial class RecommendationOverlayService : Node
         return best >= 0 ? sim.Enemies[best].SourceRef : null;
     }
 
-    // Arrow colours per advice category.
-    private static readonly Color PotionKill = new(1f, 0.35f, 0.35f);   // 처치 확정 (red)
-    private static readonly Color PotionDefend = new(0.4f, 0.7f, 1f);   // 위기 방어 (blue)
-    private static readonly Color PotionBuff = new(0.45f, 1f, 0.5f);    // 엘리트/보스 버프 (green)
-    private static readonly Color PotionPlanner = new(1f, 0.85f, 0.2f); // 플래너 추천: 지금 사용 (gold)
-
-    // Potion-use recommendation (lightweight heuristic, per the chosen triggers):
-    //   위기 방어 — lethal incoming, or incoming drops HP below 30% maxHP → a block/heal potion
-    //   처치 확정 — a damage potion outright kills an alive enemy (EffectiveHp ≤ potion damage)
-    //   엘리트/보스 — buff/utility potions only suggested in elite/boss rooms
-    // Reads the LIVE potions (DynamicVars effect amounts) + encounter RoomType.
-    // Returns the recommended potion + its arrow colour; (null, _) = nothing to suggest.
-    private static (PotionModel? potion, Color color) ComputePotionAdvice(SimState sim)
-    {
-        var cm = CombatManager.Instance;
-        if (cm == null) return (null, default);
-        if (CombatReflection.CombatManagerStateField?.GetValue(cm) is not CombatState cs) return (null, default);
-        var player = cs.Players.FirstOrDefault();
-        var potions = player?.Potions?.Where(p => p != null).ToList();
-        if (potions == null || potions.Count == 0) return (null, default);
-
-        int incoming = Sts2CombatAI.Sim.EnemyTurnSimulator.PredictPlayerDmg(sim);
-        int hpAfter = sim.PlayerHp - incoming;
-        // 2026-06-03 — relaxed defensive threshold (was 30% maxHP) so block/heal potions are
-        // suggested in normal fights too, not only at near-death. 50% = "taking real damage".
-        int dangerFloor = (int)System.Math.Ceiling(sim.PlayerMaxHp * 0.50);
-
-        PotionModel? best = null; Color bestColor = default; int bestPri = 0;
-        void Consider(int pri, PotionModel p, Color c) { if (pri > bestPri) { bestPri = pri; best = p; bestColor = c; } }
-
-        foreach (var p in potions)
-        {
-            try
-            {
-                var vars = p.DynamicVars;
-                var tgt = p.TargetType;
-                bool hasBlock = vars.ContainsKey("Block");
-                bool hasHeal = vars.ContainsKey("Heal");
-                bool hasDmg = vars.ContainsKey("Damage");
-
-                // 위기 방어 — block/heal potion
-                if (hasBlock || hasHeal)
-                {
-                    if (incoming >= sim.PlayerHp) Consider(4, p, PotionDefend);            // lethal this turn
-                    else if (incoming > 0 && hpAfter <= dangerFloor) Consider(2, p, PotionDefend); // < 30% maxHP
-                }
-
-                // 처치 확정 — damage potion that outright kills (single- or all-enemy)
-                if (hasDmg && (tgt == MegaCrit.Sts2.Core.Entities.Cards.TargetType.AnyEnemy
-                            || tgt == MegaCrit.Sts2.Core.Entities.Cards.TargetType.AllEnemies))
-                {
-                    int dmg = vars.Damage.IntValue;
-                    if (sim.Enemies.Any(e => e.IsAlive && e.EffectiveHp > 0 && e.EffectiveHp <= dmg))
-                        Consider(3, p, PotionKill);
-                }
-
-                // 2026-06-03 — buff/utility potions (neither defensive nor damage) are now
-                // suggested in normal fights too (was elite/boss-only), at the lowest priority
-                // so defend/kill advice still wins when present.
-                if (!hasBlock && !hasHeal && !hasDmg)
-                    Consider(1, p, PotionBuff);
-            }
-            catch { }
-        }
-        return (best, bestColor);
-    }
+    // Arrow colour for a planner potion recommendation (gold = "use this now").
+    private static readonly Color PotionPlanner = new(1f, 0.85f, 0.2f);
 
     // 2026-06-04 — live PotionModel whose Id matches the planner's recommendation. Null if not held.
     private static PotionModel? FindPotionById(string id)
